@@ -335,4 +335,318 @@ listen ingress-router-443
 
 The section to listen on port 80 is commented out, because for the following steps we will need a web server on that port.  
 
+```
+systemctl enable haproxy
+systemctl start haproxy
+systemctl status haproxy
+```
+
+### Install Apache
+
+Install HTTPD so we can later set up the required web server.  
+
+```
+yum install httpd
+```
+
+### Install and configure DHCP
+
+In this example, we have a basic DHCP server running on the Bastion node. For many implementations, DHCP may be running on another server, in which case these steps can be skipped.  
+
+```
+yum install dhcpd-server
+```
+
+Edit the DHCP config file, and add entries for each required host. Replace <IP_ADDRESS_HERE> and <MAC_ADDRESS_HERE> with the correct IP and MAC addresses respectively.  
+
+```
+vi /etc/dhcp/dhcpd.conf
+```
+```
+option domain-name      "example.com";
+option domain-name-servers      "ns1.example.com";
+
+authoritative;
+
+
+default-lease-time 6000;
+max-lease-time 7200;
+
+host bootstrap.test.example.com {
+    hardware ethernet <MAC_ADDRESS_HERE>;
+    fixed-address <IP_ADDRESS_HERE>;
+}
+host master1.test.example.com {
+    hardware ethernet <MAC_ADDRESS_HERE>;
+    fixed-address <IP_ADDRESS_HERE>;
+}
+host master2.test.example.com {
+    hardware ethernet <MAC_ADDRESS_HERE>;
+    fixed-address <IP_ADDRESS_HERE>;
+}
+host master3.test.example.com {
+    hardware ethernet <MAC_ADDRESS_HERE>;
+    fixed-address <IP_ADDRESS_HERE>;
+}
+host worker1.test.example.com {
+    hardware ethernet <MAC_ADDRESS_HERE>;
+    fixed-address <IP_ADDRESS_HERE>;
+}
+host worker2.test.example.com {
+    hardware ethernet <MAC_ADDRESS_HERE>;
+    fixed-address <IP_ADDRESS_HERE>;
+}
+host worker3.test.example.com {
+    hardware ethernet <MAC_ADDRESS_HERE>;
+    fixed-address <IP_ADDRESS_HERE>;
+}
+host worker4.test.example.com {
+    hardware ethernet <MAC_ADDRESS_HERE>;
+    fixed-address <IP_ADDRESS_HERE>;
+}
+```
+
+Start and enable the service and verify there are no errors.  
+
+```
+systemctl enable dhcpd
+systemctl start dhcpd
+systemctl status dhcpd
+```
+
+## Generate manifests and ignition files 
+
+Now, we have all of the prerequisites configured. As long as the DHCP and load balancer are configured correctly, then we can proceed with creating the install-config and generating the necessary manifests for installation.  
+
+### Create installation config
+
+Since we are using a hybrid-platform approach, we will be leaving *platform* as *none*, otherwise we will run into issues when trying to use the same manifests for different platforms.  
+
+Create a new directory to stage your installation files, and then create a new file called install-config.YAML:  
+
+```
+$ cd /home/core/
+$ mkdir ocp-install
+$ vi ocp-install/install-config.yaml
+```
+
+Create the following YAML file install-config.yaml.  
+Make sure the *worker* replicas is set to 0, and the *master* replicas is set to how many master nodes you will provision.  
+Replace the following placeholders with their correct values:  
+- <CLUSTER_NAME> = name of your cluster
+- <POD_SUBNET_IP> = block of IP addresses from which pod IPs are allocated
+- <SERVICE_NETWORK_IP> = IP address pool to use for service IP addresses
+- <MACHINE_NETWORK_IP> = public CIDR of the eternal network
+- <PULL_SECRET> = pull secret from the cluster manager
+- <SSH_KEY> = SSH public key for the *core* user
+
+```
+apiVersion: v1
+baseDomain: example.com
+compute:
+- hyperthreading: Enabled
+  name: worker
+  replicas: 0
+controlPlane:
+  hyperthreading: Enabled
+  name: master
+  replicas: 3
+metadata:
+  name: <CLUSTER_NAME>
+networking:
+  clusterNetwork:
+  - cidr: <POD_SUBNET_IP> # Example: 10.128.0.0/14
+    hostPrefix: 23
+  networkType: OpenShiftSDN
+  serviceNetwork:
+  - <SERVICE_NETWORK_IP> # Example: 172.30.0.0/16
+  machineNetwork:
+  - cidr: <MACHINE_NETWORK_IP> # Example: 10.0.0.0/28
+platform:
+  none: {}
+fips: false
+pullSecret: '{"auths": <PULL_SECRET>}'
+sshKey: 'ssh-rsa <SSH_KEY>'
+```
+
+Save a copy backup of this file for yourself. When the install-config is used to generate the manifests, the file is consumed, so it is important to keep a backup.  
+
+### Generate Kubernetes manifests  
+
+Now, we will use the install-config.YAML we previously created to generate the required Kubernetes manifests for our cluster.  
+
+```
+$ cd bin
+$ ./openshift-install create manifests --dir ~/ocp-install/
+```
+
+Wait for the OpenShift installer to generate the manifests. If an error occurs, ensure that install-config.YAML contains no errors and verify the correct directory was provided with the --dir flag.  
+
+Next, edit the cluster-scheduler manifest and disable mastersSchedulable.  
+
+```
+$ vi ~/ocp-install/manifests/cluster-scheduler-02-config.yml
+```
+Change *mastersSchedulable* to **false**.  
+
+Now, use the OpenShift installer to generate the Ignition configs required to provision each machine.  
+
+```
+$ ./openshift-install create ignition-configs –dir ~/ocp-install/
+```
+
+Create the merge-bootstrap.ign Ignition file, and provide the URL where your bootstrap.ign file will be staged (on the web server).   
+Replace <WEBSERVER_URL> with the URL to your web server, in our case, this would be the IP of your Bastion node.
+
+```
+$ vi ~/ocp-install/merge-bootstrap.ign
+```
+```
+{
+  "ignition": {
+    "config": {
+      "merge": [
+        {
+          "source": "http://<WEBSERVER_URL>/bootstrap.ign",
+          "verification": {}
+        }
+      ]
+    },
+    "timeouts": {},
+    "version": "3.2.0"
+  },
+  "networkd": {},
+  "passwd": {},
+  "storage": {},
+  "systemd": {}
+}
+```
+
+Now, your *ocp-install* directory should contain each of the required .ign files (bootstrap, master, worker, and merge-bootstrap).  
+
+
+### Stage Ignition files and create base64
+
+For each of the Ignition files except the bootstrap, encode the files into base64 strings.  
+```
+$ base64 -w0 master.ign > master.64
+$ base64 -w0 merge-bootstrap.ign > merge-bootstrap.64
+$ base64 -w0 worker.ign > worker.64
+```  
+
+Next, copy all of the .ign files to your web server. Make sure to set the file permissions and ownership to the core user.
+```
+cp ocp-install/*.ign /var/www/html/
+chmod 777 /var/www/html/*.ign
+chown core:core /var/www/html/*.ign
+systemctl start httpd
+systemctl enable httpd
+systemctl status httpd
+```
+
+Verify the files on the web server are accessible:  
+```
+curl -k http://localhost/bootstrap.ign
+```
+
+Get the SHA512Sum of the bootstrap.ign file, and save the output for later.  
+
+```
+sha512sum ocp-install/bootstrap.ign
+```
+
+## Provision machines and install RHCOS  
+
+Now, we are ready to provision our masters, bootstrap, and workers and install RHCOS on each.  
+
+### Install for vSphere  
+
+Starting with the vSphere machines, provision each of your required master nodes, and one bootstrap node via the vCenter UI.  
+
+1. Download the correct version of the RHCOS .OVA from the [OpenShift mirror registry](https://mirror.openshift.com/pub/openshift-v4/dependencies/rhcos/)
+2. In the vSphere client, right click on the datacenter you are using for this deployment
+3. New Folder > New VM and Template Folder
+4. Set the name as the infrastructure ID of your cluster. See the below command to find the infra ID.  
+```
+jq -r .infraID metadata.json
+```
+4. Right click on the new folder > Deploy OVF Template
+5. Select the previously downloaded .OVA file from URL or local file
+6. Select a name for the template (something generic like RHCOS is ok) and select the previously created folder
+7. Select the vSphere cluster in the compute resource tab
+8. On the Storage tab, select the storage options for your VM
+9. On the Network tab, select the network specified for your cluster
+10. Leave the Customize Template entries blank
+11. Create the template
+12. After the template creates, right click > Clone > Clone to Virtual Machine
+13. Clone the template for each machine you need and set its name (bootstrap, master1, master2, master3, etc)
+14. Repeat step 13 for each required vSphere machine
+
+### Set the IPs and Ignition data in vCenter  
+
+For this step, we have to declare the host IPs for each VMware machine, provide the base64 strings for the Ignition files, and set the necessary parameters in vCenter.  
+
+To start, disable the firewall and SELinux on the Bastion server.  
+
+Create a new Bash script to automate the next steps. Edit the script to contain your vSphere credentials, the merge-bootstrap and master base64s, your network configuration, and the VM name and IP address for each machine.  
+
+```
+export GOVC_USERNAME='username@vsphere.local'
+
+export GOVC_PASSWORD='password'
+
+export GOVC_URL='ip'
+
+export GOVC_INSECURE=true
+
+export GOVC_DATACENTER='datacenter name'
+
+# BASE64 hash of the merge-bootstrap ignition file
+BOOTS64=''
+
+# BASE64 hash of the master ignition file
+MASTER64=''
+
+# Network configuration
+SUBNET="<SUBNET_MASK_IP>"
+GW="<GATEWAY_IP>"
+DNS="<DNS_SERVER_IP>"
+
+declare -A HOSTS_IP
+HOSTS_IP["bootstrap.test.example.com"]="<BOOTSTRAP_IP>"
+HOSTS_IP["master1.test.example.com"]="<MASTER1_IP>"
+HOSTS_IP["master2.test.example.com"]="<MASTER2_IP>"
+HOSTS_IP["master3.test.example.com"]="<MASTER3_IP>"
+
+declare -A HOSTS_64
+HOSTS_64["bootstrap.test.example.com"]=${BOOTS64}
+HOSTS_64["master1.test.example.com"]=${MASTER64}
+HOSTS_64["master2.test.example.com"]=${MASTER64}
+HOSTS_64["master3.test.example.com"]=${MASTER64}
+
+
+for HOST in ${!HOSTS_IP[@]}; do
+        IPCFG="ip=${HOSTS_IP[${HOST}]}::${GW}:${SUBNET}:${HOST}::none nameserver=${DNS}"
+        govc vm.change -vm "${HOST}" -e "guestinfo.afterburn.initrd.network-kargs=${IPCFG}"
+        govc vm.change -vm "${HOST}" -e "guestinfo.ignition.config.data=${HOSTS_64[${HOST}]}"
+        govc vm.change -vm "${HOST}" -e "guestinfo.ignition.config.data.encoding=base64"
+        govc vm.change -vm "${HOST}" -e "disk.EnableUUID=TRUE"
+done
+```
+
+Modify the script permissions to allow it to be executed by the core user, and run the script:  
+```
+$ ./vm.sh
+```
+
+Lastly, power on each of the newly created VMs, and check the console to make sure the Ignition ran properly.  
+```
+Ignition: ran on 2022/03/14 14:48:33 UTC (this boot)
+Ignition: user-provided config was applied
+```
+
+### Install for bare-metal  
+
+
+
 
