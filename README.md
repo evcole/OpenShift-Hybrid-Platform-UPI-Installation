@@ -707,4 +707,157 @@ If done properly, RHCOS will be installed successfully on each worker.
 
 ## Create the cluster  
 
+To create the OpenShift Container Platform cluster, you wait for the bootstrap process to complete on the machines that you provisioned by using the Ignition config files that you generated with the installation program.
+
+**Prerequisites:**  
+
+. Create the required infrastructure for the cluster.
+. You obtained the installation program and generated the Ignition config files for your cluster.
+. You used the Ignition config files to create RHCOS machines for your cluster.
+. Your machines have direct Internet access or have an HTTP or HTTPS proxy available.
+
+Monitor the bootstrap process
+```
+ $ openshift-install --dir /home/core/ocp-install/ wait-for bootstrap-complete --log-level=info
+
+    Example output
+
+      INFO Waiting up to 30m0s for the Kubernetes API at https://api.test.example.com:6443...
+      INFO API v1.19.0 up
+      INFO Waiting up to 30m0s for bootstrapping to complete...
+      INFO It is now safe to remove the bootstrap resources
+```
+  
+The command succeeds when the Kubernetes API server signals that it has been bootstrapped on the control plane machines.
+
+After bootstrap process is complete, remove the bootstrap machine from the load balancer.
+
+*NOTE*:  
+ You must remove the bootstrap machine from the load balancer at this point. You can also remove or reformat the machine itself.
+
+Next, approve the certificate signing requests for your machines.  
+
+When you add machines to a cluster, two pending certificate signing requests (CSRs) are generated for each machine that you added. You must confirm that these CSRs are approved or, if necessary, approve them yourself. The client requests must be approved first, followed by the server requests.
+
+
+
+Confirm that the cluster recognizes the machines:
+
+```
+$ oc get nodes
+  
+[core@admin ocp-install]$ oc get nodes
+NAME                                 STATUS   ROLES    AGE   VERSION
+. master1.test.example.com     Ready    master   20d   v1.23.12+6b34f32
+. master2.test.example.com     Ready    master   20d   v1.23.12+6b34f32
+. master3.test.example.com     Ready    master   20d   v1.23.12+6b34f32
+. worker1.test.example.com     Ready    worker   20d   v1.23.12+6b34f32
+. worker2.test.example.com     Ready    worker   20d   v1.23.12+6b34f32
+. worker3.test.example.com     Ready    worker   20d   v1.23.12+6b34f32
+. worker4.test.example.com     Ready    worker   20d   v1.23.12+6b34f32
+```
+
+
+*NOTE*:  
+   The preceding output might not include the compute nodes, also known as worker nodes, until some CSRs are approved.
+
+Review the pending CSRs and ensure that you see the client requests with the Pending or Approved status for each machine that you added to the cluster:
+
+```
+   $ oc get csr
+   Example output
+
+  NAME        AGE     REQUESTOR                                                                   CONDITION
+  csr-8b2br   15m     system:serviceaccount:openshift-machine-config-operator:node-bootstrapper   Pending
+  csr-8vnps   15m     system:serviceaccount:openshift-machine-config-operator:node-bootstrapper   Pending
+```
+
+In this example, two machines are joining the cluster. You might see more approved CSRs in the list.
+
+To approve them individually, run the following command for each valid CSR:
+
+```
+   $ oc adm certificate approve csr-8b2br csr-8vnps
+```  
+
+To approve all CSRs at once:  
+
+```
+   $ oc get csr -o go-template='{{range .items}}{{if not .status}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}' | xargs --no-run-if-empty oc adm certificate approve
+```
+After all client and server CSRs have been approved, the machines have the Ready status.    
+   Verify this by running the following command:
+
+```
+    $ oc get nodes
+
+   Example output
+
+    [core@admin ocp-install]$ oc get nodes
+
+    NAME   STATUS   ROLES    AGE   VERSION
+   . master1     Ready    master   20d   v1.23.12+6b34f32
+   . master2     Ready    master   20d   v1.23.12+6b34f32
+   . master3     Ready    master   20d   v1.23.12+6b34f32
+   . worker1     Ready    worker   20d   v1.23.12+6b34f32
+   . worker2     Ready    worker   20d   v1.23.12+6b34f32
+   . worker3     Ready    worker   20d   v1.23.12+6b34f32
+   . worker4     Ready    worker   20d   v1.23.12+6b34f32
+```
+
+If all of your nodes appear, then your OpenShift cluster has successfully installed.  
+
+
+## Log into the cluster by using the CLI
+
+You can log in to your cluster as a default system user by exporting the cluster kubeconfig file. The kubeconfig file contains information about the cluster that is used by the CLI to connect a client to the correct cluster and API server. The file is specific to a cluster and is created during OpenShift Container Platform installation.
+
+**Prerequisites**:  
+
+* You deployed an OpenShift Container Platform cluster.
+* You installed the oc CLI.
+
+
+Export the kubeadmin credentials: 
+
+```
+   $ export KUBECONFIG=/home/core/ocp-install/auth/kubeconfig
+```
+
+Verify you can run oc commands successfully using the exported configuration:
+
+```
+   $ oc whoami
+```
+
+After the control plane initializes, check to make sure the required Operators are available:  
+
+```
+ $ watch -n5 oc get clusteroperators
+
+
+    [core@admin ocp-install]$ oc get co
+    NAME                                       VERSION   AVAILABLE   PROGRESSING   DEGRADED   SINCE   MESSAGE
+    authentication                             4.12.9   True        False         False      3d1h    
+    baremetal                                  4.12.9   True        False         False      20d     
+    cloud-controller-manager                   4.12.9   True        False         False      20d     
+    cloud-credential                           4.12.9   True        False         False      20d     
+    cluster-autoscaler                         4.12.9   True        False         False      20d     
+    config-operator                            4.12.9   True        False         False      20d     
+    console                                    4.12.9   True        False         False      3d1h    
+    csi-snapshot-controller                    4.12.9   True        False         False      9d      
+    dns                                        4.12.9   True        False         False      20d     
+    etcd                                       4.12.9   True        False         False      20d     
+    image-registry                             4.12.9   True        False         False      20d     
+```
+
+Now your cluster is configured. You may proceed with any day 2 configurations, such as adding an identity provider or configuring monitoring and logging.  
+
+## Delete bootstrap node  
+
+Lastly, delete your bootstrap node. Make sure to:  
+
+- Remove all "bootstrap" entries from the HAproxy, DHCP, and Named configurations
+- Delete the bootstrap VM from VMware
+- Uncomment the port 80 listener lines in the HAproxy config, if you require it
 
